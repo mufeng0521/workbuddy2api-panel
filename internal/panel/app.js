@@ -330,9 +330,9 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-/* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
-   /panel/api/packages 数据（逐账号实时查上游，能省一次是一次）。声明在路由区
-   是因为 go() 的初始调用就会触发首页卡片的渲染，必须先于它就位。 */
+/* 积分包明细共享缓存：「积分构成」页的「积分到期提醒」卡片与下方逐包明细共用
+   同一份 /panel/api/packages 数据（逐账号实时查上游，能省一次是一次）。声明在
+   路由区是因为 go() 的初始调用就可能触发到期卡片渲染，必须先于它就位。 */
 let lastPackages = null;
 let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
@@ -349,9 +349,9 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  // 到期提醒卡片：默认可见，进页面即用 overview 快照渲染（零上游请求，随首页统计
-  // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
-  // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
+  // 到期提醒卡片（在「积分构成」页，2026-10 从账号池页挪来）：默认可见，overview
+  // 每轮刷新时用快照同步渲染（零上游请求）。不再「打开账号池就打上游」——逐账号
+  // 实时查在账号多时会卡死面板。完整逐包明细由卡片上的「检查」按钮显式触发。
   if (v === 'taskscenter') reattachQueueView();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -514,7 +514,7 @@ async function loadOverview(quiet) {
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
     renderModelLocks(d.model_locks);
-    // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
+    // 到期卡片跟随 overview 刷新同步渲染（用同一份响应里的到期快照，不额外发请求）。
     // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
     if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
@@ -991,6 +991,8 @@ const CFG_MAP = {
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
   request_client_info: ['logging', 'request_client_info'],
+  realm_fallback_cn_to_global: ['realm_fallback', 'cn_to_global'],
+  realm_fallback_global_to_cn: ['realm_fallback', 'global_to_cn'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
  *
@@ -2753,7 +2755,7 @@ async function loadPackages(force) {
       api('packages'),
       api('config').catch(() => null),
     ]);
-    lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
+    lastPackages = d;                            // 缓存供积分构成页到期卡片与排序切换复用
     lastPackagesAt = Date.now();
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
@@ -2763,11 +2765,11 @@ async function loadPackages(force) {
   }
 }
 
-/* ── 积分到期提醒（首页卡片）────────────────────────────────────────── */
+/* ── 积分到期提醒（积分构成页卡片）──────────────────────────────────── */
 /* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」
    会系统性偏乐观——用不完的部分到期直接蒸发。这里把「最近要过期的是哪批、
-   有多少、到期前每天要至少消耗多少」顶到首页，数据源与「积分构成」共用
-   （lastPackages 缓存，EXP_FRESH_MS 内复用，不重复打上游）。 */
+   有多少、到期前每天要至少消耗多少」顶到「积分构成」页首，数据源与下方逐包
+   明细共用（lastPackages 缓存，EXP_FRESH_MS 内复用，不重复打上游）。 */
 
 // expBatches 把某账号的包聚合成「到期日 → 该日作废积分」升序列表。
 // 只统计 remain>0 且有到期时间的包——没余额/长期包到期没有任何影响。
@@ -2859,7 +2861,8 @@ function renderExpiry(d) {
 
 /* 快照版到期提醒：不查上游，直接用 /overview 已有的 credits_earliest_expiry /
    credits_earliest_remaining（由签到与余额后台刷新写入 state.json，默认每 5 分钟
-   更新一次）。打开面板即可看到「最近哪批要过期」，成本与首页统计条相同为零。
+   更新一次）。打开面板即可看到「最近哪批要过期」，渲染挂在 overview 刷新上，
+   成本为零（同一份响应顺带渲染，不额外发请求）。
 
    与 renderExpiry（逐包明细版）的差异：这里只有**最早一批**的日期与数量，没有
    后续批次、也没法算「7 天内合计」——那是 packages 接口才有的信息。因此卡片上
