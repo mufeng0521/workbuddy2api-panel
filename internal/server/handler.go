@@ -62,6 +62,13 @@ type Config struct {
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
 
+	// RealmFallbackCnToGlobal / RealmFallbackGlobalToCn 跨域回退开关
+	// （config realm_fallback.cn_to_global / global_to_cn）。cn 池限额/限频/禁用或
+	// 选不出可用号时，切到 global 用同名裸模型重试一轮；反向同理。GlobalEnabled
+	// 为 false 时两者都不生效。零值 = 关（既有测试与裸用配置行为不变）。
+	RealmFallbackCnToGlobal bool
+	RealmFallbackGlobalToCn bool
+
 	// Usage 逐请求用量记录器（可选；nil = 不记录）。
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
@@ -610,6 +617,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
+	// bindSticky 绑定会话粘性号，但仅当成功号属于**本次请求的原始 realm**
+	// （模型前缀解析出的那个）时。
+	//
+	// 为什么必须查域：跨域回退（cn: → global:）成功后若按老逻辑无条件 Bind，
+	// 会话被绑到另一域账号，而客户端后续仍发 cn: 前缀——下一轮进入循环时
+	// 「粘性号 realm 不符 → 解绑 → 重选」，白抖一轮且那条绑定永远不可能命中。
+	// 同域场景（含同域轮转换号）acct.Realm()==realm 恒成立，既有粘性语义零变化。
+	bindSticky := func(a *auth.Auth) {
+		if sessKey == "" || h.cfg.Session == nil || a == nil {
+			return
+		}
+		if a.Realm() != realm {
+			return
+		}
+		h.cfg.Session.Bind(sessKey, a.UID)
+	}
 	// ttfb 首 token 等待（仅流式有观测；非流式传 0 = 无观测，速率不扣减）。
 	// 显式入参而不是读 st.ttfb：后者在流式分支里是**调用之后**才赋值的，
 	// 靠顺序传递会让将来重排代码时静默把速率算回旧的错口径。
@@ -739,12 +762,40 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
-	for i := 0; i < h.cfg.MaxRotate; i++ {
+	// 跨域回退（realm fallback）状态：curRealm 是本轮正在试的域（初始 = 请求前缀
+	// 解析出的域），realmSwitched 保证整个请求只回退一次（防两域互踢死循环）。
+	// maxAttempts 是总尝试预算：初始 MaxRotate，切域时在原位 +1 次（切域消耗的那次
+	// 不计入轮转）之外再追加 MaxRotate 次——即回退后另一域另有完整一轮轮转预算。
+	// i 保持单调递增（rotateBackoff(i,...) 的既有退避口径零改动），故预算闸门从
+	// for 头移到循环体最顶部。
+	curRealm := realm
+	realmSwitched := false
+	maxAttempts := h.cfg.MaxRotate
+	for i := 0; ; i++ {
+		if i >= maxAttempts {
+			// 本域轮转预算耗尽。若失败可归咎于本域（限额/限频/禁用，见
+			// realmFallbackEligible）且开关允许，切到另一 realm 再给一轮预算。
+			// lastErr 不清：若另一域也失败，末端错误映射仍以完整轮转的最近一次
+			// 失败为口径（错误透传语义不变）。
+			if !realmSwitched && h.realmFallbackAllowed(curRealm) && realmFallbackEligible(lastErr) {
+				from := curRealm
+				curRealm = otherRealm(curRealm)
+				realmSwitched = true
+				maxAttempts = i + 1 + h.cfg.MaxRotate
+				if h.cfg.Upstream != nil {
+					modelRate = h.cfg.Upstream.ModelRate(curRealm, bareModel)
+				}
+				log.Printf("WARN: [server] realm fallback: model=%s realm=%s budget exhausted -> retry on %s",
+					peek.Model, from, curRealm)
+				continue
+			}
+			break
+		}
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
+			if acct == nil || (curRealm != "" && acct.Realm() != curRealm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
 				unbindSticky()
@@ -754,9 +805,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, curRealm)
 		}
 		if acct == nil {
+			// 本域选不出可用号（全冷却/全禁用/在途占满）。若开关允许且本域确有账号
+			// （total>0：域是配了号的，只是此刻都不可用；空域不算"本域耗尽"），
+			// 切到另一 realm 再试——cn 池打干时 global 池可能还有号。
+			// tried 不清空：两域 uid 不相交，跨域回退不受本域已试号影响。
+			if !realmSwitched && h.realmFallbackAllowed(curRealm) {
+				if total, _, _, _, _ := h.cfg.Pool.CountsDetailedForRealm(curRealm); total > 0 {
+					from := curRealm
+					curRealm = otherRealm(curRealm)
+					realmSwitched = true
+					maxAttempts = i + 1 + h.cfg.MaxRotate
+					if h.cfg.Upstream != nil {
+						modelRate = h.cfg.Upstream.ModelRate(curRealm, bareModel)
+					}
+					log.Printf("WARN: [server] realm fallback: model=%s no servable account in realm=%s -> retry on %s",
+						peek.Model, from, curRealm)
+					continue
+				}
+			}
 			st.status = http.StatusServiceUnavailable
 			// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 			//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -1009,9 +1078,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeInterrupted
 				h.cfg.Pool.NoteSuccess(acct.UID)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
+				bindSticky(acct)
 			default:
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
@@ -1021,9 +1088,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
 				// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-				if sessKey != "" && h.cfg.Session != nil {
-					h.cfg.Session.Bind(sessKey, acct.UID)
-				}
+				// bindSticky 内查域：跨域回退的号不绑（防下一轮 cn: 请求「命中→域不符解绑」抖动）。
+				bindSticky(acct)
 			}
 			credit, hasCredit := stats.Credit()
 			if hit, miss, ok := stats.CacheTokens(); ok {
@@ -1103,9 +1169,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
-		}
+		bindSticky(acct)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if hasCredit {
 			st.credit = credit

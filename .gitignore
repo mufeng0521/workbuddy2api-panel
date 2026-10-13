@@ -45,3 +45,9 @@ docs/
 *.zip
 server.exe
 .DS_Store
+
+# 本地 agent 工具目录（mimosa 扫描缓存等）
+.mimosa/
+
+# 本地重启换二进制时的旧版备份（回滚用，不入库）
+wb2api.exe.old

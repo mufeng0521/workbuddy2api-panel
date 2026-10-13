@@ -376,6 +376,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `schedule.keepalive_enabled` | `true` | token 保活总开关 |
 | `schedule.blackcat_enabled` | `true` | 夜猫子总开关 |
 | `schedule.include_disabled_in_tasks` | `false` | 让**保号类**四任务（签到 / 活跃上报 / token 保活 / 余额刷新）对**已禁用**账号也执行——「禁用」只关选号，不停保号。`false`（默认）保持「禁用的跳过」 |
+| `realm_fallback.cn_to_global` | `true` | **跨域回退**：cn 池遇限额（402 余额耗尽）/限频（429）/账号禁用（session 失效、账号级风控）或选不出可用号时，自动切到 global 池用同名裸模型重试一轮（客户端无感，一个请求只回退一次）；`global.enabled=false` 时一票否决；改动需重启 |
+| `realm_fallback.global_to_cn` | `false` | 反向回退：global 池遇同样情形时切回 cn 池（默认关——global 是溢出通道，避免把限流压力引回 CN 池）；改动需重启 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新 / 签到 / 余额 / 模型列表）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
@@ -659,7 +661,7 @@ http://127.0.0.1:7863/panel/
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `logging.request_client_info`、`pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；
-涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`）
+涉及进程装配期依赖的字段（`listen`、`auth_dir`、`state_file`、`upstream.*`、`upstash.*`、`session_sticky.ttl`、`realm_fallback.*`）
 保存后会提示"需重启进程生效"。配置写入采用「深合并且原子替换」：只更新面板表单覆盖的键，
 用户手写的未知键与其余字段原样保留。
 

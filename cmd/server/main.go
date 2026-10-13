@@ -310,6 +310,10 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 跨域回退开关（realm_fallback 段）：cn 池限额/限频/禁用或选不出号时切
+		// global 重试（缺省开）；反向缺省关。
+		RealmFallbackCnToGlobal: cfg.RealmFallback.CnToGlobal,
+		RealmFallbackGlobalToCn: cfg.RealmFallback.GlobalToCn,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -534,6 +538,9 @@ func restartRequiredFields(c *Config) []string {
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout")
+	// realm_fallback 在装配期注入 handler（跨域回退开关是 handler 静态字段），
+	// 改动需重启进程——不列会显示"已保存"却仍按旧开关路由。
+	out = append(out, "realm_fallback")
 	return out
 }
 

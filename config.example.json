@@ -41,6 +41,10 @@
     "chat_base": "",
     "billing_base": ""
   },
+  "realm_fallback": {
+    "cn_to_global": true,
+    "global_to_cn": false
+  },
   "upstream": {
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,

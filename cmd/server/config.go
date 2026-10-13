@@ -121,6 +121,17 @@ type Config struct {
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
 
+	RealmFallback struct {
+		// CnToGlobal cn 池遇到限额（ErrHardCredit）/限频（ErrSoftRate）/账号禁用
+		// （ErrSessionDead/ErrAccountFault）或选不出可用号时，自动切到 global 池用
+		// 同名裸模型重试一次（客户端无感）。缺省 true（靠 Default() 显式赋值，
+		// 键缺席保留默认值，显式 false 才关闭——同 Schedule 开关的既有模式）。
+		CnToGlobal bool `json:"cn_to_global"`
+		// GlobalToCn 反向回退：global 池耗尽时切回 cn 池。缺省 false——global 一般
+		// 是溢出通道，反向回切会把 global 限流的压力引回 cn 池（用户显式打开才启用）。
+		GlobalToCn bool `json:"global_to_cn"`
+	} `json:"realm_fallback"`
+
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
@@ -271,6 +282,10 @@ func Default() *Config {
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
+	// 跨域回退缺省：cn → global 开（cn 池打干时借道国际版，客户端无感）；反向关
+	// （global 是溢出通道，默认不把压力引回 cn 池）。键缺席时保留此值，显式 false 才关。
+	c.RealmFallback.CnToGlobal = true
+	c.RealmFallback.GlobalToCn = false
 	c.Features.SanitizeBlacklistFingerprints = true
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3

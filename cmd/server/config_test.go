@@ -859,3 +859,59 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestRealmFallbackConfigDefaults realm_fallback 缺省与覆盖口径：
+// cn_to_global 缺省 true（键缺席保留默认，显式 false 才关）、global_to_cn 缺省 false；
+// 显式 true 生效；序列化 roundtrip 不丢值（面板保存走同一 ParseConfigInto 路径）。
+func TestRealmFallbackConfigDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if !c.RealmFallback.CnToGlobal {
+		t.Errorf("cn_to_global 缺省应为 true: %+v", c.RealmFallback)
+	}
+	if c.RealmFallback.GlobalToCn {
+		t.Errorf("global_to_cn 缺省应为 false: %+v", c.RealmFallback)
+	}
+
+	// 键缺席（空对象）→ 保留缺省。
+	absent, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absent.RealmFallback.CnToGlobal || absent.RealmFallback.GlobalToCn {
+		t.Fatalf("键缺席应保留缺省: %+v", absent.RealmFallback)
+	}
+
+	// 显式 false 覆盖缺省 true。
+	off, err := ParseConfig([]byte(`{"realm_fallback":{"cn_to_global":false}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.RealmFallback.CnToGlobal {
+		t.Fatalf("显式 false 未覆盖缺省: %+v", off.RealmFallback)
+	}
+
+	// 显式打开反向回退。
+	both, err := ParseConfig([]byte(`{"realm_fallback":{"cn_to_global":true,"global_to_cn":true}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !both.RealmFallback.CnToGlobal || !both.RealmFallback.GlobalToCn {
+		t.Fatalf("显式 true 未生效: %+v", both.RealmFallback)
+	}
+
+	// roundtrip：序列化后再解析取回同值。
+	raw, err := json.Marshal(both)
+	if err != nil {
+		t.Fatal(err)
+	}
+	round, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !round.RealmFallback.CnToGlobal || !round.RealmFallback.GlobalToCn {
+		t.Fatalf("roundtrip 丢值: %+v", round.RealmFallback)
+	}
+}
