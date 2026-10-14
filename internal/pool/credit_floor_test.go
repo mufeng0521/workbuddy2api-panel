@@ -353,7 +353,8 @@ func TestCreditFloorFallbackAllowsFreeModel(t *testing.T) {
 	auth.BackfillRealmFor(poor, "global")
 	p.Add(poor)
 	p.SetCredits("poor", 1, 0)
-	p.Cooldown("poor", CoolSoft, 2*time.Minute, "test")
+	// 冷却 10s：落回默认兜底探测窗口（30s）内，兜底路径才能选到它。
+	p.Cooldown("poor", CoolSoft, 10*time.Second, "test")
 
 	if a := p.PickExcludingForRealm(nil, "hy3", "global"); a == nil {
 		t.Fatal("兜底路径对免费模型应放行触底号，got nil")

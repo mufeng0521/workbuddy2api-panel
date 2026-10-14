@@ -363,6 +363,9 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
 	const soft = 45 * time.Second
+	// softJitterCap：软冷却退避上限 = 基数 +0~10% 正向抖动（jitterUpSoft 只加不减）
+	// 向上取整留余量——45s × 1.1 = 49.5s → 51s。
+	const softJitterCap = 51
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
 
 	rec := httptest.NewRecorder()
@@ -377,9 +380,9 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
 	}
-	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
+	// 冷却时长取自注入的 SoftCooldown（上限含 +10% 正向抖动），不依赖真实等待。
+	if st.CoolRemaining <= 0 || st.CoolRemaining > softJitterCap {
+		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, softJitterCap)
 	}
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
@@ -412,8 +415,9 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 		if st.SoftStreak != 1 {
 			t.Errorf("call %d: 冷却中兜底探测不应推进 soft_streak, got %d", i, st.SoftStreak)
 		}
-		if st.CoolRemaining < 600-3 || st.CoolRemaining > 600 {
-			t.Errorf("call %d: cool_remaining_sec=%d want ~600（不堆加）", i, st.CoolRemaining)
+		// 上限 660 = 600s + 10% 正向抖动（jitterUpSoft 只加不减）；不堆加。
+		if st.CoolRemaining < 600-3 || st.CoolRemaining > 660 {
+			t.Errorf("call %d: cool_remaining_sec=%d want ~600（不堆加，含 ≤10%% 抖动）", i, st.CoolRemaining)
 		}
 	}
 }
@@ -444,6 +448,30 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 	}
 }
 
+// TestApplyErrorPolicy14017UsesFixedCooldown 14017（trial not activated）护栏：冷却基数
+// 用独立常量 accountFaultCooldown（10m），不随 soft_rate 配置联动——恢复依赖用户完成
+// register（人工动作），不是限流退避，随 soft_rate 缩短是意外耦合。
+func TestApplyErrorPolicy14017UsesFixedCooldown(t *testing.T) {
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	h := NewHandler(Config{Pool: p, SoftCooldown: 5 * time.Second}) // soft_rate 配得很小，验证 14017 不受其影响
+
+	body := `{"code":14017,"msg":"trial not activated"}`
+	fixedSec := int64(accountFaultCooldown / time.Second)
+	for i := 1; i <= 2; i++ {
+		h.applyErrorPolicy("u1", upstream.ErrAccountFault, body, "", nil)
+		st, _ := p.Status("u1")
+		if !st.Cooling || st.CoolKind != "soft_rate" {
+			t.Fatalf("call %d: 14017 应保持 soft 冷却（不 Disable）: %+v", i, st)
+		}
+		// 基数取自 accountFaultCooldown（600s）而非注入的 soft_rate（5s）。
+		if st.CoolRemaining < fixedSec-3 || st.CoolRemaining > fixedSec {
+			t.Errorf("call %d: 14017 cool_remaining_sec=%d want ~%d（固定基数 %ds，非 soft_rate 5s）",
+				i, st.CoolRemaining, fixedSec, fixedSec)
+		}
+	}
+}
+
 // TestNewHandlerSoftCooldownDefault 端到端：未注入 SoftCooldown 时基数回落到 600s（原为 60s）。
 func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
@@ -469,7 +497,8 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
 	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
+	// 上限 660 = 600s + 10% 正向抖动（jitterUpSoft 只加不减）。
+	if st.CoolRemaining <= 599 || st.CoolRemaining > 660 {
 		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
 	}
 }
@@ -734,8 +763,8 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("bad should be soft cooling: %+v", st)
 	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
+	// 冷却时长 = 注入 soft 基数(60s) + ≤10% 正向抖动（jitterUpSoft），非解析时间（无重置文案）。
+	if st.CoolRemaining <= 0 || st.CoolRemaining > 66 {
 		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
 	}
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {

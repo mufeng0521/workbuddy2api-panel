@@ -22,6 +22,27 @@ func withNoPickGap(t *testing.T) {
 	t.Cleanup(func() { minPickGap = old })
 }
 
+// withSoftJitterOff 临时关闭软冷却退避的正向抖动（softCooldownJitterFrac=0），
+// 让断言冷却时长的测试不被 +0~10% 随机偏移干扰。必须在触发冷却写入之前调用。
+func withSoftJitterOff(t *testing.T) {
+	t.Helper()
+	old := softCooldownJitterFrac
+	softCooldownJitterFrac = 0
+	t.Cleanup(func() { softCooldownJitterFrac = old })
+}
+
+// coolUntilOf 读取账号当前 until（包内测试用，配合抖动断言精确比较截止时刻）。
+func coolUntilOf(t *testing.T, p *Pool, uid string) time.Time {
+	t.Helper()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		t.Fatalf("uid %s not in pool", uid)
+	}
+	return e.until
+}
+
 func TestPickHighestCredits(t *testing.T) {
 	withNoPickGap(t)
 	// 三因子加权（credits 比例×10 + 闲置 + 成功率）：积分悬殊时高积分账号应被多数选中，
@@ -677,6 +698,7 @@ func expireCooldown(p *Pool, uid string) {
 func TestCooldownSoftExponentialBackoff(t *testing.T) {
 	// 同一账号**跨冷却期**连续软限流 → 时长按 2 倍指数增长（吸收上游：冷却中的
 	// 兜底探测不再堆加，堆加只发生在到期后的新一轮限流）。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour) // 封顶 1h：本用例三步（600/1200/2400）都不触及
@@ -693,6 +715,7 @@ func TestCooldownSoftExponentialBackoff(t *testing.T) {
 
 func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
 	// 注入封顶：streak 3 的 400s 被压到 250s（跨冷却期堆加）。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(250 * time.Second)
@@ -709,6 +732,7 @@ func TestCooldownSoftCappedBySoftRateMax(t *testing.T) {
 
 func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 	// 未注入 softRateMax → 按 2h 封顶（避免裸用池时退避无上限）。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	for i, want := range []int64{600, 1200, 2400, 4800, 7200} {
@@ -723,6 +747,7 @@ func TestCooldownSoftDefaultCapWhenUnset(t *testing.T) {
 
 func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 	// 非正值保留原值（风格同 SetBreaker）：0 不应把封顶清零导致无上限。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(0)
@@ -738,6 +763,7 @@ func TestSetSoftRateMaxIgnoresNonPositive(t *testing.T) {
 
 func TestCooldownSoftStreakResetBySuccess(t *testing.T) {
 	// 成功即证明账号恢复 → streak 归零，下次软冷却回到基数。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -759,6 +785,7 @@ func TestCooldownSoftKeptByReenable(t *testing.T) {
 	// 软限流冷却（CoolSoft）与 softStreak 保留——限流恢复证据是重置墙钟/退避到期，
 	// 不是余额恢复（余额刷新每 5 分钟一次，若在此清冷却域，限流保护实际寿命被压到
 	// 一个刷新周期内）。熔断域（fails/retryCount/breakerUntil）不动，与既有 C5 语义一致。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
@@ -786,6 +813,7 @@ func TestCooldownSoftKeptByReenable(t *testing.T) {
 
 func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	// 硬冷却（余额耗尽）时长由签到时点决定，不参与软退避指数。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownUntilTomorrow4AM("u1", "余额不足")
@@ -797,6 +825,7 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 }
 
 func TestSoftStreakPersistsAcrossReload(t *testing.T) {
+	withSoftJitterOff(t)
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	p := New(fp)
@@ -827,6 +856,7 @@ func TestSoftStreakPersistsAcrossReload(t *testing.T) {
 
 func TestSoftStreakMissingInLegacyStateFile(t *testing.T) {
 	// 旧 state.json 无 soft_streak → 零值兼容，退避从基数重新开始。
+	withSoftJitterOff(t)
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(fp, []byte(`{"accounts":{"u1":{"credits":100}}}`), 0o600); err != nil {
@@ -891,6 +921,7 @@ func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
 	// 无解析时间（resetAt 零值）→ 有界退避（600s 起）。冷却中的兜底探测再撞 429
 	// **不推进 streak、不延长**（吸收上游：旧「每次探测都翻倍」正是全池被推到
 	// 2h 封顶的元凶）。
+	withSoftJitterOff(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(time.Hour)
@@ -898,6 +929,112 @@ func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
 	wantCoolSec(t, p, "u1", 600, 3)
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Time{}, "", "429 rate limit")
 	wantCoolSec(t, p, "u1", 600, 3) // 仍在冷却中：不堆加
+}
+
+// TestCooldownSoftRateJitterForwardOnly 账号级退避落地时叠加 [0,+10%] 正向抖动：
+// 注入定值源钉住两端（0 → 精确等于基数；1 → 1.1 倍），并采样验证恒 ≥ 基数。
+func TestCooldownSoftRateJitterForwardOnly(t *testing.T) {
+	oldRand := softCooldownJitterRand
+	t.Cleanup(func() { softCooldownJitterRand = oldRand })
+
+	const base = 600 * time.Second
+	p := New("")
+	p.Add(&auth.Auth{UID: "zero"})
+	p.Add(&auth.Auth{UID: "one"})
+
+	// 源返回 0：until = now + base（无偏移）。
+	softCooldownJitterRand = func() float64 { return 0 }
+	before := time.Now()
+	p.CooldownSoftRate("zero", base, time.Time{}, "429 rate limit")
+	if d := coolUntilOf(t, p, "zero").Sub(before); d < base || d > base+time.Second {
+		t.Fatalf("jitter=0: until-now=%v want ~%v", d, base)
+	}
+
+	// 源返回 1（上限）：until ≈ now + 1.1*base。
+	softCooldownJitterRand = func() float64 { return 1 }
+	before = time.Now()
+	p.CooldownSoftRate("one", base, time.Time{}, "429 rate limit")
+	if d := coolUntilOf(t, p, "one").Sub(before); d < base*11/10 || d > base*11/10+time.Second {
+		t.Fatalf("jitter=1: until-now=%v want ~%v (1.1x)", d, base*11/10)
+	}
+
+	// 恒 ≥ 基数：抖动只加不减（随机源采样）。
+	softCooldownJitterRand = rand.Float64
+	for i := 0; i < 20; i++ {
+		uid := fmt.Sprintf("j%d", i)
+		p.Add(&auth.Auth{UID: uid})
+		before = time.Now()
+		p.CooldownSoftRate(uid, base, time.Time{}, "429 rate limit")
+		if d := coolUntilOf(t, p, uid).Sub(before); d < base {
+			t.Fatalf("sample %d: until-now=%v < base=%v（抖动不得为负）", i, d, base)
+		}
+	}
+}
+
+// TestCooldownSoftForModelBackoffJitter 模型级（resetAt 零值）退避分支同口径：
+// 正向抖动在 softDurationLocked 之后施加，只加不减。
+func TestCooldownSoftForModelBackoffJitter(t *testing.T) {
+	oldRand := softCooldownJitterRand
+	t.Cleanup(func() { softCooldownJitterRand = oldRand })
+
+	const base = 600 * time.Second
+	p := New("")
+	p.Add(&auth.Auth{UID: "zero"})
+	p.Add(&auth.Auth{UID: "one"})
+
+	softCooldownJitterRand = func() float64 { return 0 }
+	before := time.Now()
+	p.CooldownSoftForModel("zero", base, time.Time{}, "", "429 rate limit")
+	if d := coolUntilOf(t, p, "zero").Sub(before); d < base || d > base+time.Second {
+		t.Fatalf("model jitter=0: until-now=%v want ~%v", d, base)
+	}
+
+	softCooldownJitterRand = func() float64 { return 1 }
+	before = time.Now()
+	p.CooldownSoftForModel("one", base, time.Time{}, "glm-5.3", "429 rate limit")
+	if d := coolUntilOf(t, p, "one").Sub(before); d < base*11/10 || d > base*11/10+time.Second {
+		t.Fatalf("model jitter=1: until-now=%v want ~%v (1.1x)", d, base*11/10)
+	}
+}
+
+// TestCooldownSoftRateResetAtNotJittered 防回归：resetAt 路径精确对齐上游墙钟，
+// 不走本地退避、不施加抖动（抖动只属于「本地退避」分支）。
+func TestCooldownSoftRateResetAtNotJittered(t *testing.T) {
+	oldRand := softCooldownJitterRand
+	t.Cleanup(func() { softCooldownJitterRand = oldRand })
+	softCooldownJitterRand = func() float64 { return 1 } // 若被误用必现放大
+
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	reset := time.Now().Add(5 * time.Minute)
+	p.CooldownSoftRate("u1", 600*time.Second, reset, "429 rate limit")
+	if got := coolUntilOf(t, p, "u1"); !got.Equal(reset) {
+		t.Fatalf("resetAt 路径必须精确对齐墙钟（不抖动）: until=%v want=%v", got, reset)
+	}
+}
+
+// TestCooldownSoftJitterAppliedAfterCap 锁不变量：抖动在 softDurationLocked（含
+// softRateMax 封顶）**之后**施加，且不把结果钳回封顶——until 允许超出封顶最多 10%。
+// 若有人把 jitterUpSoft 移进 softDurationLocked（封顶前）或抖动后再补钳制，本用例必须红。
+func TestCooldownSoftJitterAppliedAfterCap(t *testing.T) {
+	oldRand := softCooldownJitterRand
+	t.Cleanup(func() { softCooldownJitterRand = oldRand })
+	softCooldownJitterRand = func() float64 { return 1 }
+
+	p := New("")
+	p.SetSoftRateMax(250 * time.Second)
+	p.Add(&auth.Auth{UID: "u1"})
+	// 第一次退避：streak=1 时 softDurationLocked 短路（不参与封顶，d=600s），只为把
+	// streak 推到 2——封顶只在 streak>1 的放大分支生效。
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit")
+	expireCooldown(p, "u1")
+	before := time.Now()
+	p.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "429 rate limit")
+	// 第二次退避：streak 2 → 600<<1=1200s 先被 softRateMax 封顶到 250s，再 +10% 抖动
+	// → 275s：> 封顶（证 jitter 在封顶后）、不钳回。
+	if d := coolUntilOf(t, p, "u1").Sub(before); d < 275*time.Second || d > 275*time.Second+100*time.Millisecond {
+		t.Fatalf("until-now=%v want ≈275s（封顶 250s + 10%% 抖动，不得钳回封顶）", d)
+	}
 }
 
 // TestPickExcludingForModelSkipsSoftCoolingSameModel 冷却中账号（6004 带解析时间，
@@ -1258,6 +1395,8 @@ func TestBreakerExponentialBackoffCapped(t *testing.T) {
 
 func TestFallbackPicksEarliestExpiry(t *testing.T) {
 	p := New("")
+	// 放宽探测窗口到 3h：本用例测「最早到期」选取语义，两个候选（1h/2h）都要在窗口内。
+	p.SetFallbackProbeWindow(3 * time.Hour)
 	p.Add(&auth.Auth{UID: "late"})
 	p.Add(&auth.Auth{UID: "early"})
 	// 两个都软冷却；early 更早到期 → 兜底选 early。
@@ -1271,6 +1410,8 @@ func TestFallbackPicksEarliestExpiry(t *testing.T) {
 
 func TestFallbackSkipsDisabled(t *testing.T) {
 	p := New("")
+	// 放宽探测窗口：本用例测「跳过禁用号」语义，cooled（1h）须在窗口内才可被选。
+	p.SetFallbackProbeWindow(3 * time.Hour)
 	p.Add(&auth.Auth{UID: "cooled"})
 	p.Add(&auth.Auth{UID: "dead"})
 	p.Cooldown("cooled", CoolSoft, time.Hour, "x")
@@ -1306,6 +1447,8 @@ func TestFallbackAllHardReturnsNil(t *testing.T) {
 func TestFallbackSoftAndBreakerParticipate(t *testing.T) {
 	// D3：soft 与 breaker 冷却号允许参与兜底，取最早到期者。
 	p := New("")
+	// 放宽探测窗口：本用例测「参与+最早」语义，soft(10m)/brk(5m) 都须在窗口内。
+	p.SetFallbackProbeWindow(3 * time.Hour)
 	p.Add(&auth.Auth{UID: "soft"})
 	p.Add(&auth.Auth{UID: "brk"})
 	p.Cooldown("soft", CoolSoft, 10*time.Minute, "429") // soft: until=10m, fails=1
@@ -1327,6 +1470,45 @@ func TestFallbackNilWhenAllDisabled(t *testing.T) {
 	p.Disable("u1", "session dead")
 	if got := p.Pick(); got != nil {
 		t.Fatalf("want nil when all disabled, got %+v", got)
+	}
+}
+
+// TestFallbackProbeWindowFiltersFarCooldown 兜底探测窗口：默认 30s 下，剩余冷却超过
+// 窗口的号不参与兜底（Pick 返回 nil，不再打注定再吃 429 的深冷却号）；放宽窗口即命中；
+// 窗口内的短冷却照常命中。
+func TestFallbackProbeWindowFiltersFarCooldown(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "far"})
+	p.Cooldown("far", CoolSoft, 5*time.Minute, "429")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("5m 冷却超出默认 30s 探测窗口，兜底应返回 nil，got %+v", got)
+	}
+	p.SetFallbackProbeWindow(10 * time.Minute)
+	if got := p.Pick(); got == nil || got.UID != "far" {
+		t.Fatalf("窗口放宽到 10m 后应命中 far，got %+v", got)
+	}
+
+	// 剩余冷却 20s（默认窗口 30s 内）→ 命中。
+	p2 := New("")
+	p2.Add(&auth.Auth{UID: "soon"})
+	p2.Cooldown("soon", CoolSoft, 20*time.Second, "429")
+	if got := p2.Pick(); got == nil || got.UID != "soon" {
+		t.Fatalf("20s 冷却在默认 30s 窗口内应命中，got %+v", got)
+	}
+}
+
+// TestSetFallbackProbeWindowIgnoresNonPositive 非正值保留原值（风格同 SetSoftRateMax）：
+// 0/负值不得把窗口清零回落默认 30s。
+func TestSetFallbackProbeWindowIgnoresNonPositive(t *testing.T) {
+	p := New("")
+	p.SetFallbackProbeWindow(90 * time.Second)
+	p.SetFallbackProbeWindow(0)
+	p.SetFallbackProbeWindow(-time.Second)
+	p.mu.RLock()
+	got := p.fallbackProbeWindowOr()
+	p.mu.RUnlock()
+	if got != 90*time.Second {
+		t.Fatalf("fallbackProbeWindowOr()=%v want 90s（非正值不得覆盖已注入值）", got)
 	}
 }
 

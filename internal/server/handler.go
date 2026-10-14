@@ -112,6 +112,11 @@ func (h *Handler) softCooldown() time.Duration {
 // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
 const notFoundCooldown = 60 * time.Second
 
+// accountFaultCooldown 14017「trial not activated」的账号级软冷却时长。
+// 独立常量的原因：14017 的恢复依赖用户完成 register（人工动作），不是限流退避，
+// 不该随 soft_rate（600s→120s）连带变短——原先复用 h.softCooldown() 是意外耦合。
+const accountFaultCooldown = 10 * time.Minute
+
 // ServiceName 网关身份标识。经 /healthz 响应体 service 字段与 X-Service 头同时透出：
 // 宿主（如 workbuddy-switch 托管网关子进程）探测同端口的旧服务/其他服务时，对方即使
 // 返回 2xx 也不带本标识，宿主据此可识别"假成功"。
@@ -1405,35 +1410,44 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
 		//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
 		//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+		// 每条落地路径补一条 WARN（path 标注来源：重置文案 / Retry-After 头 / 裸退避），
+		// 429 软冷却不再"静默发生"——排障时一眼看出号被哪个形态罚、基数多大。
 		modelRateLimited := upstream.IsModelRateLimit(body)
+		base := h.softCooldown()
+		uid8 := logfmt.UID8(uid)
 		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			if modelRateLimited {
-				h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
+				h.cfg.Pool.CooldownSoftForModel(uid, base, resetAt, model, "6004 model rate limit")
+				log.Printf("WARN: [server] soft rate cooldown acct=%s path=body-reset-model model=%s base=%s", uid8, model, base)
 				return
 			}
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+			h.cfg.Pool.CooldownSoftRate(uid, base, resetAt, "429 rate limit")
+			log.Printf("WARN: [server] soft rate cooldown acct=%s path=body-reset-account model=%s base=%s", uid8, model, base)
 			return
 		}
 		// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 		// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 		if uerr != nil && uerr.RetryAfter > 0 {
-			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			h.cfg.Pool.CooldownSoftRate(uid, base, time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
 			if modelRateLimited {
 				h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 			}
+			log.Printf("WARN: [server] soft rate cooldown acct=%s path=retry-after model=%s base=%s", uid8, model, base)
 			return
 		}
 		// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 		// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 		// （热改优先），管理面板改 soft_rate 后立即生效。
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+		h.cfg.Pool.CooldownSoftRate(uid, base, time.Time{}, "429 rate limit")
 		if modelRateLimited {
 			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 		}
+		log.Printf("WARN: [server] soft rate cooldown acct=%s path=backoff model=%s base=%s", uid8, model, base)
 	case upstream.ErrWafBlock:
 		// WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：基数
-		// wafCooldownBase（60s，抖动后落 [45s,75s]）、softStreak 指数升级、封顶
-		// soft_rate_max、冷却中兜底探测不翻倍——全部继承既有语义。
+		// wafCooldownBase（60s）先经 jitterDur 双向 ±25% 抖动，进入 pool 退避分支后
+		// 再叠 jitterUpSoft 正向 +0~10% → 复合区间 [45s, 82.5s]；softStreak 指数升级、
+		// 封顶 soft_rate_max、冷却中兜底探测不翻倍——全部继承既有语义。
 		// Retry-After 头优先（WAF 拦截页可能带该头）。不 Disable。
 		if uerr != nil && uerr.RetryAfter > 0 {
 			h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
@@ -1456,7 +1470,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 			h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 			return
 		}
-		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
+		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, accountFaultCooldown, "account fault (14017)")
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
@@ -1513,8 +1527,9 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	})
 }
 
-// wafCooldownBase WAF 403 软冷却基数（建议 60s 起；抖动 ±25% 后落 [45s,75s]，
-// 实际进入 CooldownSoftRate 后再按 softStreak 指数、封顶 soft_rate_max）。
+// wafCooldownBase WAF 403 软冷却基数（建议 60s 起；经 jitterDur 双向 ±25% 后落 [45s,75s]，
+// 该值再进 CooldownSoftRate 时又叠加一层正向 +0~10% 抖动（jitterUpSoft），复合区间
+// [45s,82.5s]；之后按 softStreak 指数、封顶 soft_rate_max）。
 // 与 SoftCooldown 分流的原因：WAF 403 是 IP/指纹维频控，信号比 429「账号级限流」轻
 // （账号本身健康），但比 404 重（带粘性会连环）；60s 级的快速避让已足够让频控窗口
 // 滑过。抖动复用 backoff.go jitterDur（单一来源）。

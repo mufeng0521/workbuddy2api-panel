@@ -211,6 +211,12 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// FallbackProbeWindow 全冷却兜底探测窗口：池内无 healthy 候选时，只有剩余
+		// 冷却 ≤ 窗口的账号才允许被兜底探测选中，更远的冷却号直接跳过（选号返回
+		// nil，由 handler 走 503 / 切域）。深冷却号几乎注定再吃 429——白白消耗上游
+		// 调用与轮转预算、放大限流噪音（冷却中再 429 不延长冷却，但也毫无收益）。
+		// 默认 "30s"。
+		FallbackProbeWindow string `json:"fallback_probe_window"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
@@ -237,6 +243,8 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// FallbackProbeWindowDur 解析后的全冷却兜底探测窗口；<=0 时 normalize 回写默认 30s。
+	FallbackProbeWindowDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 }
@@ -305,6 +313,9 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 全冷却兜底探测窗口默认 30s：只探快到期（≤30s）的号，避免每个请求都去打
+	// 注定再吃 429 的深冷却号。
+	c.Pool.FallbackProbeWindow = "30s"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -537,6 +548,19 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
+	}
+	// 全冷却兜底探测窗口：空值回落默认 30s（Default 已置；此兜底覆盖显式 ""）；
+	// 解析失败 fail fast（拼写错误不静默）；<=0 回写 "30s"（与 MaxInFlightGlobal 同口径：
+	// 非正值没有合理语义——0 窗口会让兜底完全失效，反倒把全冷却场景卡成永久 503）。
+	if c.Pool.FallbackProbeWindow == "" {
+		c.Pool.FallbackProbeWindow = "30s"
+	}
+	if c.FallbackProbeWindowDur, err = time.ParseDuration(c.Pool.FallbackProbeWindow); err != nil {
+		return fmt.Errorf("pool.fallback_probe_window: %w", err)
+	}
+	if c.FallbackProbeWindowDur <= 0 {
+		c.Pool.FallbackProbeWindow = "30s"
+		c.FallbackProbeWindowDur = 30 * time.Second
 	}
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {

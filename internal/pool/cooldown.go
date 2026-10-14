@@ -5,9 +5,29 @@ package pool
 
 import (
 	"log"
+	"math/rand/v2"
 	"strings"
 	"time"
 )
+
+// softCooldownJitterFrac 软冷却「本地退避」时长的正向抖动比例（0~+10%）：高并发下多号
+// 常在同一批 429 里被罚，固定时长会让它们同时解冻再聚团撞限流；随机正向偏移把到期
+// 相位打散。只加不减——抖动后绝不会短于配置基数，退避语义不因抖动变松。测试置 0 关闭。
+var softCooldownJitterFrac = 0.10
+
+// softCooldownJitterRand 抖动随机源（测试可注入定值源验证边界；生产用 math/rand/v2）。
+var softCooldownJitterRand = rand.Float64
+
+// jitterUpSoft 给软冷却退避时长叠加 [0, frac) 的正向抖动。d<=0 或比例为 0 时原样返回。
+//
+// 施加点在 softDurationLocked（含 softRateMax 封顶）**之后**：until 最多超出封顶 10%，
+// 有意为之——若先把抖动钳回封顶，被封顶的号会重新落回同一相位，散相失效。
+func jitterUpSoft(d time.Duration) time.Duration {
+	if d <= 0 || softCooldownJitterFrac <= 0 {
+		return d
+	}
+	return d + time.Duration(float64(d)*softCooldownJitterFrac*softCooldownJitterRand())
+}
 
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
@@ -167,7 +187,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			if e.coolKind != CoolSoft || !now.Before(e.until) {
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++
-				e.until = now.Add(d)
+				e.until = now.Add(jitterUpSoft(d)) // 正向抖动：打散同批到期聚团（封顶后施加，见 jitterUpSoft）
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
@@ -382,7 +402,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 			d := p.softDurationLocked(base, e.softStreak+1)
 			e.softStreak++
-			e.until = now.Add(d)
+			e.until = now.Add(jitterUpSoft(d)) // 正向抖动：打散同批到期聚团（封顶后施加，见 jitterUpSoft）
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
@@ -412,6 +432,16 @@ func (p *Pool) softRateMaxOr() time.Duration {
 		return p.softRateMax
 	}
 	return defaultSoftRateMax
+}
+
+// fallbackProbeWindowOr 返回生效的全冷却兜底探测窗口（未注入时按默认 30s）。
+// 选号兜底侧只允许「剩余冷却 ≤ 本窗口」的号被探测（见 pickEarliestExpiryLocked）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) fallbackProbeWindowOr() time.Duration {
+	if p.fallbackProbeWindow > 0 {
+		return p.fallbackProbeWindow
+	}
+	return defaultFallbackProbeWindow
 }
 
 // softDurationLocked 按连续软冷却次数把基数 d 指数放大：d << (streak-1)，封顶 softRateMax。

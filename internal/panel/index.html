@@ -980,6 +980,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">国际版在途上限</span>
                 <input name="max_in_flight_global" type="number" min="1" placeholder="2">
                 <span class="hint">global 域风控更紧，默认 2</span></label>
+              <label class="fld"><span class="lb">全冷却兜底探测窗口</span>
+                <input name="fallback_probe_window" placeholder="30s">
+                <span class="hint">全冷却时仅探测剩余冷却 ≤ 窗口的号</span></label>
               <label class="fld"><span class="lb">连续失败熔断阈值</span>
                 <input name="breaker_threshold" type="number" min="1" placeholder="3"></label>
             </div>

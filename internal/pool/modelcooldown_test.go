@@ -541,7 +541,10 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	p.SetCredits("cooled", 100, 0)
 	p.SetCredits("exempt", 50, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 cooled
-	p.Cooldown("cooled", CoolSoft, time.Hour, "429")    // 全账号级冷却，无模型级记录
+	// 放宽探测窗口：本用例测「全账号冷却 vs 模型豁免」优先级（兜底须能选到 1h 冷却的
+	// cooled），不测 30s 默认窗口的节流语义（后者由 TestFallbackProbeWindowFiltersFarCooldown 覆盖）。
+	p.SetFallbackProbeWindow(3 * time.Hour)
+	p.Cooldown("cooled", CoolSoft, time.Hour, "429") // 全账号级冷却，无模型级记录
 	p.CooldownSoftForModel("exempt", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 
 	// 请求 other：cooled 被全账号冷却拦截（即使无模型独立冷却），exempt 模型豁免

@@ -915,3 +915,44 @@ func TestRealmFallbackConfigDefaults(t *testing.T) {
 		t.Fatalf("roundtrip 丢值: %+v", round.RealmFallback)
 	}
 }
+
+// TestFallbackProbeWindowNormalize pool.fallback_probe_window 归一：缺省/空/"0"/负值
+// 回落 "30s"（<=0 没有合理语义——0 会让兜底完全失效）；非法值 fail fast；正值原样保留。
+func TestFallbackProbeWindowNormalize(t *testing.T) {
+	c := Default()
+	if c.Pool.FallbackProbeWindow != "30s" {
+		t.Errorf("default fallback_probe_window=%q want 30s", c.Pool.FallbackProbeWindow)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.FallbackProbeWindowDur != 30*time.Second {
+		t.Errorf("default dur=%v want 30s", c.FallbackProbeWindowDur)
+	}
+
+	for _, in := range []string{"", "0", "-5s"} {
+		c := Default()
+		c.Pool.FallbackProbeWindow = in
+		if err := c.normalize(); err != nil {
+			t.Fatalf("in=%q: normalize err=%v", in, err)
+		}
+		if c.Pool.FallbackProbeWindow != "30s" || c.FallbackProbeWindowDur != 30*time.Second {
+			t.Errorf("in=%q: got %q / %v want 30s / 30s", in, c.Pool.FallbackProbeWindow, c.FallbackProbeWindowDur)
+		}
+	}
+
+	c = Default()
+	c.Pool.FallbackProbeWindow = "90s"
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize 90s: %v", err)
+	}
+	if c.Pool.FallbackProbeWindow != "90s" || c.FallbackProbeWindowDur != 90*time.Second {
+		t.Errorf("90s: got %q / %v want 90s / 90s", c.Pool.FallbackProbeWindow, c.FallbackProbeWindowDur)
+	}
+
+	c = Default()
+	c.Pool.FallbackProbeWindow = "abc"
+	if err := c.normalize(); err == nil {
+		t.Error("unparsable fallback_probe_window should fail fast")
+	}
+}

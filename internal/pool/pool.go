@@ -25,6 +25,11 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// fallbackProbeWindow 全冷却兜底探测窗口（SetFallbackProbeWindow 注入；默认
+	// defaultFallbackProbeWindow 30s）：池内无 healthy 候选时，只有剩余冷却 ≤ 窗口的
+	// 账号才允许被兜底探测；更远的冷却号跳过（Pick 返回 nil，handler 走 503/切域）。
+	// 见 fallbackProbeWindowOr 与 pickEarliestExpiryLocked。
+	fallbackProbeWindow time.Duration
 	// costExploreInterval costTier 条件探索窗口（issue #136 方案 a′，SetCostExploreInterval
 	// 注入；默认 defaultCostExploreInterval 30m）。tier 0 垄断 + tier 1 存在且距上次
 	// 探索 ≥ 窗口时，本次 pick 生效层切 tier 1-only（探索=搭车改道，零新增上游请求）。
@@ -143,6 +148,16 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.softRateMax = d
+	}
+}
+
+// SetFallbackProbeWindow 注入全冷却兜底探测窗口（main 从 config 解析后调用）。
+// 非正值保留原值（回落默认 30s，见 fallbackProbeWindowOr），风格同 SetSoftRateMax。
+func (p *Pool) SetFallbackProbeWindow(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.fallbackProbeWindow = d
 	}
 }
 

@@ -295,6 +295,9 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
+//
+// 探测窗口（fallbackProbeWindow）：只对「剩余冷却 ≤ 窗口」的号做兜底，全冷却早期
+// 直接返回 nil 由 handler 处置（503/切域）——详见下方过滤处注释。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
@@ -318,6 +321,13 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		}
 		exp := e.expiry(now)
 		if exp.IsZero() {
+			continue
+		}
+		// 探测窗口节流：剩余冷却超出窗口的号不参与兜底——打它几乎注定再吃 429，
+		// 白白消耗上游调用与轮转预算（冷却中再 429 不延长冷却，但也毫无收益）。
+		// 全冷却早期（所有号都离到期很远）这里会全部跳过、Pick 返回 nil，由 handler
+		// 走 503 / 切域，而不是拿请求去喂注定失败的探测。
+		if exp.After(now.Add(p.fallbackProbeWindowOr())) {
 			continue
 		}
 		if best == nil || exp.Before(best.expiry(now)) {

@@ -509,6 +509,11 @@ const (
 // 避免测试/裸用池时退避无上限。
 const defaultSoftRateMax = 2 * time.Hour
 
+// defaultFallbackProbeWindow 全冷却兜底探测的默认窗口：fallbackProbeWindow 未注入
+// （<=0）时按此值算。只探剩余冷却 ≤ 窗口的号——30s 覆盖「快到期的号值得再试一次」，
+// 又不至于让每个请求都去打深冷却号（那是级联 429 的放大器）。
+const defaultFallbackProbeWindow = 30 * time.Second
+
 // defaultDegrade* 连败降权默认参数（issue #114）：连败 5 次临时出池 10 分钟。
 const (
 	defaultDegradeThreshold   = 5

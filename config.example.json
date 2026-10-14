@@ -82,6 +82,7 @@
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
+    "fallback_probe_window": "30s",
     "credit_floor": 100
   },
   "session_sticky": {
