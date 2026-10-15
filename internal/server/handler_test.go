@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,6 +97,35 @@ func (b *bindStore) lastUID(key string) (string, bool) {
 	defer b.mu.Unlock()
 	u, ok := b.binds[key]
 	return u, ok
+}
+
+// syncBuf 线程安全的 log 捕获缓冲：handler 的日志可能来自多个 goroutine，
+// 裸 bytes.Buffer 并用会在 -race 下报数据竞争。
+type syncBuf struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuf) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLogs 把标准 log 输出接到内存缓冲（本包测试无 t.Parallel，进程级 log.SetOutput
+// 安全）。返回缓冲与恢复函数，调用方 defer 恢复，避免污染后续用例。
+func captureLogs(t *testing.T) (*syncBuf, func()) {
+	t.Helper()
+	old := log.Writer()
+	buf := &syncBuf{}
+	log.SetOutput(buf)
+	return buf, func() { log.SetOutput(old) }
 }
 
 // testPoolWith 构建一个所有账号 credits=1000 的池，并注入确定性随机源：
@@ -605,6 +635,181 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
 	}
 	p.Release("bad")
+}
+
+// TestStickyUnbindLogsOnUnavailable 粘性号不可用（冷却 → PickByUIDForModel 返回 nil）：
+// 请求解绑该会话并回落轮换成功，同时打一条 reason=unavailable 的观测 WARN。
+func TestStickyUnbindLogsOnUnavailable(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Minute,
+		Store: st,
+		// 会话侧 Available 是静态列表：粘性号在会话路由里仍"可用"，
+		// 不可用判定发生在池侧 PickByUIDForModel（正是要观测的静默解绑点）。
+		Available: func() []string { return []string{"sticky01", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "sticky01", AccessToken: "at-sticky", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-unbind", "sticky01")
+	p.Cooldown("sticky01", pool.CoolSoft, time.Minute, "test cooling")
+
+	buf, restore := captureLogs(t)
+	defer restore()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-unbind"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	logs := buf.String()
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 截断口径：sess = 会话键前 8 字节，acct = uid 前 8 位。
+	if !strings.Contains(logs, "WARN: [server] sticky unbind sess=conv-unb acct=sticky01 reason=unavailable") {
+		t.Fatalf("want sticky unbind WARN reason=unavailable, got logs: %s", logs)
+	}
+
+	// 会话键是客户端可控自由文本：内嵌 \n 不得把 WARN 拆成两行，ESC 不得进入日志。
+	// 该键恰 8 字节（截断不动），\n 与 ESC 应被替成 '?'。
+	bound := "a\nb\x1b[31m"
+	sess.Bind(bound, "sticky01")
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(
+		`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"a\nb\u001b[31m"}}`))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	logs = buf.String()
+
+	if rec2.Code != 200 {
+		t.Fatalf("control-char request: code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	var unbindLines []string
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.Contains(line, "sticky unbind") {
+			unbindLines = append(unbindLines, line)
+		}
+	}
+	if len(unbindLines) != 2 {
+		t.Fatalf("want exactly 2 sticky unbind lines (one per request), got %d: %q", len(unbindLines), unbindLines)
+	}
+	if !strings.Contains(unbindLines[1], "sess=a?b?[31m acct=sticky01 reason=unavailable") {
+		t.Errorf("control chars must be sanitized to '?' on a single line, got: %q", unbindLines[1])
+	}
+	if strings.ContainsAny(unbindLines[1], "\x1b\r") {
+		t.Errorf("control chars leaked into log line: %q", unbindLines[1])
+	}
+}
+
+// TestStickyUnbindLogNotEmittedOnPlainRotation 普通轮转（未配置 Session，无粘性/无解绑）：
+// 失败换号路径照常走，但 sticky unbind 只在真解绑时打，此处不得出现该行。
+func TestStickyUnbindLogNotEmittedOnPlainRotation(t *testing.T) {
+	var bad, good int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			bad++
+			return 500, `{"code":500}`, false
+		}
+		good++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("bad", 2000, 0) // bad 积分高，确定性随机源 → 先被选中
+	p.SetCredits("good", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+
+	buf, restore := captureLogs(t)
+	defer restore()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-plain"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	logs := buf.String()
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 正向控制：失败换号确实发生（bad 失败 → good 成功），负向断言非空跑。
+	if bad != 1 || good != 1 {
+		t.Fatalf("want rotation bad=1 good=1, got bad=%d good=%d", bad, good)
+	}
+	if strings.Contains(logs, "sticky unbind") {
+		t.Fatalf("plain rotation must not log sticky unbind, got logs: %s", logs)
+	}
+}
+
+// TestStickyUnbindLogsOnRequestFailed 粘性号上游失败（fail 闭包解绑）：
+// 打一条 reason=request_failed 的观测 WARN，随后轮换换号成功。
+func TestStickyUnbindLogsOnRequestFailed(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"bad", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if authz == "Bearer at-bad" {
+			return 500, `{"code":500}`, false
+		}
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-failed", "bad")
+
+	buf, restore := captureLogs(t)
+	defer restore()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-failed"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	logs := buf.String()
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(logs, "WARN: [server] sticky unbind sess=conv-fai acct=bad reason=request_failed") {
+		t.Fatalf("want sticky unbind WARN reason=request_failed, got logs: %s", logs)
+	}
+}
+
+// TestStickyUnbindLogsOnRealmMismatch 粘性号 realm 与请求前缀不符（cn 请求钉在 global 号上）：
+// 解绑并打 reason=realm 的观测 WARN；本域无号且跨域回退开关关闭 → 503。
+func TestStickyUnbindLogsOnRealmMismatch(t *testing.T) {
+	enableGlobalRealm(t)
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"g1"} },
+	})
+	p := testPoolWith(globalAcct("g1", "at-g1"))
+	up := realmFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-realm", "g1")
+
+	buf, restore := captureLogs(t)
+	defer restore()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-realm"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	logs := buf.String()
+
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(logs, "WARN: [server] sticky unbind sess=conv-rea acct=g1 reason=realm") {
+		t.Fatalf("want sticky unbind WARN reason=realm, got logs: %s", logs)
+	}
 }
 
 func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {

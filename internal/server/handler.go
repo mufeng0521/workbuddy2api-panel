@@ -615,10 +615,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			stickyUID = ""
 		}
 	}
+	// logStickyUnbind 为解绑打一条观测 WARN。解绑本身是既有语义（粘性号不可用/被抢/失败时
+	// 回落普通轮换），但此前全程静默：粘性号处于冷却/占满/模型限额期间，每个请求都会白解绑
+	// +重绑到新号，上游 prompt 前缀缓存命中率受损却无从观测。
+	// sess 只留会话键前 8 字节（logfmt.Truncate rune 安全截断；空键打 "-"），acct 只留 uid
+	// 前 8 位（与流水行同口径）——长会话键/全量 uid 不进日志。
+	// 会话键是客户端可控自由文本，截断后再把控制符（<0x20 / 0x7f）替成 '?'：内嵌 \n 会把
+	// 一条 WARN 拆成两行（可伪造日志记录），ESC 会污染面板日志；可打印 ASCII 与多字节
+	// 字符原样保留。消毒只做在这一处，不改 logfmt.Truncate 本体——model/UA 等调用方不该被牵连。
+	// uid 由调用方传入而非读 stickyUID：unbindSticky 会把它清空，顺序错了就打成空。
+	logStickyUnbind := func(uid, reason string) {
+		sess := strings.Map(func(r rune) rune {
+			if r < 0x20 || r == 0x7f {
+				return '?'
+			}
+			return r
+		}, logfmt.Truncate(sessKey, 8))
+		if sess == "" {
+			sess = "-"
+		}
+		log.Printf("WARN: [server] sticky unbind sess=%s acct=%s reason=%s", sess, logfmt.UID8(uid), reason)
+	}
 	// fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
 	fail := func(uid string) {
 		releaseHeld()
 		if stickyUID != "" && uid == stickyUID {
+			logStickyUnbind(uid, "request_failed")
 			unbindSticky()
 		}
 	}
@@ -802,7 +824,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
 			if acct == nil || (curRealm != "" && acct.Realm() != curRealm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
-				// 本次回落普通轮换。
+				// 本次回落普通轮换。reason 区分成因：acct 为 nil = 不可用（Pick 不细分哪种），
+				// 否则是 realm 不符。
+				reason := "unavailable"
+				if acct != nil {
+					reason = "realm"
+				}
+				logStickyUnbind(stickyUID, reason)
 				unbindSticky()
 				acct = nil
 			}
@@ -850,6 +878,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 若被抢的正是粘性号，立即解绑并回落普通轮换，避免下一轮仍撞同一个
 			// 满载粘性号再浪费一次 PickByUID 往返（语义与 fail()/PickByUID-nil 的解绑一致）。
 			if stickyUID != "" && acct.UID == stickyUID {
+				// reason=acquire_race 的频次就是「单会话并发超过粘性号在途上限」的直接计数：
+				// Pick 过号后名额被同一会话的并发请求抢走才会走到这里，是粘性限制并发这一
+				// 副作用的唯一观测点。
+				logStickyUnbind(acct.UID, "acquire_race")
 				unbindSticky()
 			}
 			if !rotateBackoff(i, r.Context()) {
