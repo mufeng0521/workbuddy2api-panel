@@ -219,6 +219,63 @@ func TestChatBadParams400CarriesUpstreamBody(t *testing.T) {
 	}
 }
 
+// TestChatModelParamInvalidFailsFastNoRotate 上游 400 + code 11133「参数被模型提供方
+// 拒绝」（线上 2026-10-16：非视觉模型收到带图请求，上游对同一 body 在所有账号上
+// 均如此拒绝）→ ErrBadParams 通道：首个账号上立即 400 透传上游原文、**不轮转**
+// （轮转是把确定失败的请求伪装成"暂时没号"，客户端会按可重试语义无限重试）、
+// 账号零惩罚（无冷却/禁用/熔断/连败/降权）。
+func TestChatModelParamInvalidFailsFastNoRotate(t *testing.T) {
+	const upstreamBody = `{"code":11133,"msg":"Invalid request parameters","requestId":"x","extError":{"code":"0","message":"the request parameters were rejected by the model provider","param":"images"}}`
+	calls := 0
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls++
+		return 400, upstreamBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s (want 400: 11133 is request-level, must not degrade to 503)", rec.Code, rec.Body)
+	}
+	var resp struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
+	}
+	if resp.Error.Code != "bad_params" {
+		t.Errorf("error.code=%q want bad_params body=%s", resp.Error.Code, rec.Body)
+	}
+	if !strings.Contains(resp.Error.Message, "Invalid request parameters") {
+		t.Errorf("message must carry upstream 11133 text verbatim: %q", resp.Error.Message)
+	}
+	if strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("request-level failure must not be reported as account exhaustion: %s", rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1 (fail-fast: 11133 must not rotate accounts)", calls)
+	}
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("status %s missing", uid)
+		}
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 ||
+			st.ConsecutiveFails != 0 || !st.DegradeUntil.IsZero() {
+			t.Errorf("account %s must stay clean after 11133 (no cooling/degrade/breaker): %+v", uid, st)
+		}
+	}
+}
+
 func TestChatNonStreamAggregates(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz != "Bearer at1" {

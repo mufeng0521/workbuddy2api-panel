@@ -35,7 +35,7 @@ const (
 	ErrNotFound                      // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                        // 5xx 上游故障
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
-	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
+	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）、11133（参数被模型提供方拒绝，如模型不支持图片）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
@@ -155,7 +155,13 @@ var contentBlockedMarkers = []string{
 
 // badParamsMarkers 请求体解析失败关键词（issue #41 连带）：HTTP 400 + 上游
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
-// 与账号健康无关——不罚号，但仍轮转（commit B）。
+// 与账号健康无关——不罚号、不轮转（fail-fast，见 handler 的 ErrBadParams 分支）。
+//
+// 11133（参数被模型提供方拒绝）与 11101 同在 ErrBadParams 通道：它发生在模型
+// 提供方参数校验层（extError.param 指向具体参数，如 "images"），阶段不同但同样
+// 是"请求的问题不是账号的问题"——同模型池内所有账号 serving 同一上游模型，
+// 同一 body 换账号结果不变；模型能力不匹配（如非视觉模型带图）由客户端换模型
+// 解决，轮转健康号只会放大无效请求。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
 
 // invalidImageMarkers 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
@@ -587,7 +593,11 @@ func Classify(status int, body string) ErrKind {
 		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
 		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
 		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		// 11133（参数被模型提供方拒绝，如模型不支持图片）定位不同：发生在模型提供方
+		// 参数校验层——请求已进入模型路由但被 serving 该模型的上游校验拒绝，同一模型
+		// 池内所有账号行为一致（换账号结果不变），fail-fast 理由同 11101 不变。
+		// codeMarker 自带 JSON 空白容差（`"code": 11133` 等 6 形态）。
+		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) || codeMarker(lower, "11133") {
 			return ErrBadParams
 		}
 		return ErrClient

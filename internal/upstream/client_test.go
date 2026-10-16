@@ -49,6 +49,19 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`, ErrBadParams},
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
+		// 11133「参数被模型提供方拒绝」（线上 2026-10-16：非视觉模型带图，上游对同一
+		// body 在所有账号上 400）与 11101 同通道 fail-fast：与账号无关，不轮转不罚号。
+		{400, `{"code":11133,"msg":"Invalid request parameters","requestId":"x","extError":{"code":"0","message":"the request parameters were rejected by the model provider","param":"images"}}`, ErrBadParams},
+		// 空白容差：`"code": 11133` 形态（codeMarker，同 11135 口径）。
+		{400, `{"code": 11133, "msg":"Invalid request parameters"}`, ErrBadParams},
+		// 字符串形态 `"code":"11133"` 同命中（与 11135 的 `{"code": "11135", ...}`
+		// 对应用例同口径）。
+		{400, `{"code":"11133","msg":"Invalid request parameters"}`, ErrBadParams},
+		// 500 + 11133 仍归 ErrServer：5xx 服务端故障优先，不因 body 带该 code 降级为
+		// 请求级错误（防误判）。
+		{500, `{"code":11133,"msg":"Invalid request parameters"}`, ErrServer},
+		// 其他业务码不受影响，仍走通用 4xx 兜底。
+		{400, `{"code":11199,"msg":"unknown business error"}`, ErrClient},
 		// 图片格式/数据错误是确定性请求错误，分类后不轮转、不罚号。
 		{400, `{"code":11101,"msg":"Parse message failed: invalid image_url content at index 2: json: cannot unmarshal string into Go value of type v2.ImageContent"}`, ErrImageInvalid},
 		{400, `{"code":11135,"msg":"invalid_image_data"}`, ErrImageInvalid},
@@ -56,8 +69,9 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 防过宽：11133（模型不支持图片）不进 image_invalid——归 ErrBadParams
+		// fail-fast 通道（见上方 11133 用例）。
+		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrBadParams},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
