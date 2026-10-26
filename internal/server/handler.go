@@ -907,8 +907,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
-			// （healthyForModel），realm 谓词过滤跨域账号。
 			pickRealm := curRealm
 			if crossRealm && h.cfg.Pool.ServableForModelRealm(bareModel, curRealm) == 0 &&
 				h.cfg.Pool.ServableForModelRealm(bareModel, otherRealm(curRealm)) > 0 {
@@ -955,9 +953,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
-		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != curRealm {
-			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
-			// 而不是请求前缀声明的域。
+		if h.cfg.Upstream != nil {
+			// 每轮按实际服务账号的域重算积分倍率：crossRealm 命中另一域、或
+			// realm fallback 切域后选回原域，台账的 ModelRate 都保持真实域口径
+			// （无条件重算也顺带消除「上一轮跨域值残留到本轮」的陈旧写法）。
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)
 		}
 		tried[acct.UID] = true

@@ -586,8 +586,9 @@ func restartRequiredFields(c *Config) []string {
 	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。
 	out = append(out, "upstream.user_agent")
-	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）。
-	out = append(out, "cn.chat_base")
+	// cn.chat_base 同样只在装配期写进 up.ChatBaseCN（请求路径并发读取，不做热改）；
+	// global.chat_base / global.billing_base 同理（写 up.ChatBaseGlobal/BillingBaseGlobal）。
+	out = append(out, "cn.chat_base", "global.chat_base", "global.billing_base")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
