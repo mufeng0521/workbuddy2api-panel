@@ -264,6 +264,10 @@ function rateLimitMeta(row, now) {
     };
   }
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  // detail 必须显式声明：app.js 全文 'use strict'，裸赋值未声明变量会在
+  // 「账号有模型级限流」时抛 ReferenceError，把整个账号池表格渲染打断
+  // （统计卡在前、表格在后，于是呈现「有统计、无账号」的假空池，2026-11-11 实锤）。
+  let detail;
   if (until && resetAt && until < resetAt) {
     // 双时钟（issue #171 问题二）：黄框出现/消失由 until 决定（网关为防超长
     // 限流拖死全池，把重试封顶在 now+softRateMax），主文字却按 resetAt 显示，

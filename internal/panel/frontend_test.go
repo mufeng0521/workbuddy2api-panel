@@ -193,7 +193,10 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+// app.js 全文 'use strict'：VM 片段必须同样严格模式，否则裸赋值未声明变量
+// （如 rateLimitMeta 的 detail，2026-11-11 实锤）在 VM 里静默建全局、测试照绿，
+// 浏览器里却抛 ReferenceError 打断整个账号池渲染。
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();

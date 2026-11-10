@@ -42,8 +42,13 @@ const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inl
 	"connect-src 'self'; img-src 'self' data:; form-action 'none'; " +
 	"frame-ancestors 'none'; base-uri 'none'"
 
-// setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
+// setSecurityHeaders 写入面板统一响应头（页面与 API 都要，API 也含 JSON 数据）。
 func setSecurityHeaders(w http.ResponseWriter) {
+	// no-cache（可缓存但每次须回源验证）：面板前端经 go:embed 打进二进制，服务重启
+	// 升级后浏览器若还持有旧 app.js（此前静态处理器不设任何缓存头，Chrome 会长期
+	// 缓存且无验证器可回验），就会拿旧前端对不上新接口形状。资源总共 ~180KB 且走
+	// 本机/隧道，全量回源成本可忽略；换来的确定性是「页面永远与当前二进制同代」。
+	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff") // 禁 MIME 嗅探
 	w.Header().Set("X-Frame-Options", "DENY")           // 老浏览器兜底（CSP frame-ancestors 的等价项）
